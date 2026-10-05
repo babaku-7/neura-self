@@ -634,11 +634,16 @@ class NeuraBot(commands.Bot):
                     self.console.print(Align.center("[bold cyan]https://github.com/routo-loop/neura-self[/bold cyan]"))
                     self.console.print(Align.center(f"[bold red]{line}[/bold red]"))
                     self.console.print("\n")
-                    sys.exit(0)
+                    if os.environ.get("NEURA_STRICT_VERSION", "0") == "1":
+                        sys.exit(0)
+                    self.log("WARN", f"Continuing on {CURRENT_VERSION} (latest {latest_version}). Set NEURA_STRICT_VERSION=1 to enforce updates.")
+                    return False
                 else:
                     self.log("SYS", "You are on the latest version.")
+                    return True
         except Exception as e:
             self.log("WARN", f"Version check failed: {e}")
+        return True
     
     async def run_bot(self):
         self.check_version()
