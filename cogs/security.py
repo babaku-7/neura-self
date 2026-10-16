@@ -48,6 +48,7 @@ class Security(commands.Cog):
             "bannedformacros"
         ]
         self.captcha_keywords = [
+            "captcha",
             "areyouarealhuman",
             "verifythatyouarehuman",
             "pleasecompletethiswithin",
@@ -56,11 +57,18 @@ class Security(commands.Cog):
             "pleasedmmewiththefollowing",
             "pleasedmmewithonly",
             "ifyouhavetroublesolvingthecaptcha",
-            "pleasecomplete",
-            "tocheckthatyouareahuman",
-            "tocheck",
-            "human"
         ]
+        self.captcha_patterns = [
+            re.compile(r"\bare you a real human\b", re.I),
+            re.compile(r"\b(?:check|verify)\s+that\s+you\s+are(?:\s+\w+){0,3}\s+human\b", re.I),
+            re.compile(r"\b(?:complete|solve|finish)\s+(?:the\s+|your\s+)?captcha\b", re.I),
+            re.compile(r"\bplease\s+complete\s+(?:(?:the|this|your)\s+)?(?:captcha|verification|challenge|check)\b", re.I),
+            re.compile(r"\bplease\s+use\s+the\s+link\s+below\b", re.I),
+        ]
+        self.captcha_url_pattern = re.compile(
+            r"https?://(?:www\.)?owobot\.com/captcha(?:[/?#][^\s<>()\]]*)?",
+            re.I,
+        )
         self.warning_pattern = re.compile(r'\(\s*(\d+)\s*/\s*(\d+)\s*\)')
         self.image_captcha_keywords = [
             "pleasedmme",
@@ -166,14 +174,16 @@ class Security(commands.Cog):
         return any(k in cleaned for k in keywords)
 
     def _get_captcha_url(self, message):
-        if not message.components:
-            return None
-        for comp in message.components:
-            if not getattr(comp, "children", None): continue
-            for child in comp.children:
+        for comp in getattr(message, "components", []) or []:
+            for child in getattr(comp, "children", []) or []:
                 url = str(getattr(child, "url", "") or "")
-                if "owobot.com/captcha" in url:
+                if self.captcha_url_pattern.search(url):
                     return url
+
+        for embed in getattr(message, "embeds", []) or []:
+            url = str(getattr(embed, "url", "") or "")
+            if self.captcha_url_pattern.search(url):
+                return url
         return None
 
     def _get_security_text(self, message):
@@ -184,6 +194,7 @@ class Security(commands.Cog):
                 getattr(getattr(embed, "author", None), "name", "") or "",
                 getattr(embed, "description", "") or "",
                 getattr(getattr(embed, "footer", None), "text", "") or "",
+                getattr(embed, "url", "") or "",
             ])
             for field in getattr(embed, "fields", []) or []:
                 parts.extend([
@@ -198,14 +209,83 @@ class Security(commands.Cog):
                     if value:
                         parts.append(str(value))
 
+        for attachment in getattr(message, "attachments", []) or []:
+            for attr in ("filename", "content_type"):
+                value = getattr(attachment, attr, None)
+                if value:
+                    parts.append(str(value))
+
         return " ".join(str(part) for part in parts if part)
+
+    def _has_captcha_signal(self, text):
+        readable = unicodedata.normalize("NFKC", text or "")
+        readable = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", readable)
+        if any(pattern.search(readable) for pattern in self.captcha_patterns):
+            return True
+        return self._contains_keyword(readable, self.captcha_keywords)
+
+    def _is_recent_message(self, message, max_age=60):
+        try:
+            age = (discord.utils.utcnow() - message.created_at).total_seconds()
+        except Exception:
+            return False
+        return 0 <= age <= max_age
+
+    def _find_captcha_url(self, message, text=None):
+        component_url = self._get_captcha_url(message)
+        if component_url:
+            return component_url
+        search_text = text if text is not None else self._get_security_text(message)
+        match = self.captcha_url_pattern.search(search_text)
+        return match.group(0) if match else None
+
+    def _pause_for_captcha(self):
+        reason = getattr(self.bot, "security_pause_reason", None)
+        if reason:
+            self.bot.log("SECURITY", f"Captcha signal ignored while {reason} pause is active.")
+            return False
+        self.bot.captcha_detected = True
+        self.bot.security_pause_reason = "captcha"
+        self.bot.paused = True
+        self.bot.throttle_until = float("inf")
+        return True
+
+    def _pause_for_ban(self):
+        self.bot.captcha_detected = False
+        self.bot.security_pause_reason = "ban"
+        self.bot.paused = True
+        self.bot.throttle_until = float("inf")
+
+    def _resume_after_captcha(self):
+        if getattr(self.bot, "security_pause_reason", None) != "captcha":
+            self.bot.log("SECURITY", "Ignoring verification because the bot is not paused for captcha.")
+            return False
+        self.bot.captcha_detected = False
+        self.bot.security_pause_reason = None
+        self.bot.throttle_until = 0.0
+        if not getattr(self.bot, "manual_paused", False):
+            self.bot.paused = False
+        return True
 
     @commands.Cog.listener()
     async def on_message(self, message):
         if not self.enabled: return
         if (message.guild is None or isinstance(message.channel, discord.DMChannel)) and message.author.id == int(self.monitor_id):
-            if (discord.utils.utcnow() - message.created_at).total_seconds() > 30: return
-            if "i have verified that you are human" in message.content.lower():
+            message_text = self._get_security_text(message)
+            if self._contains_keyword(message_text, self.ban_keywords):
+                self._pause_for_ban()
+                self.bot.log("ALARM", f"BAN DETECTED IN DM! Message: {message_text[:200]}")
+                await self.play_beep()
+                self._show_desktop_notification("Ban detected!")
+                self._send_webhook("BAN DETECTED", f"Message:\n{message_text[:200]}")
+                return
+
+            if re.search(r"\bverified that you are(?:\s+\w+){0,3}\s+human\b", message_text, re.I):
+                if not self._is_recent_message(message):
+                    self.bot.log("SECURITY", "Ignoring stale captcha verification message.")
+                    return
+                if not self._resume_after_captcha():
+                    return
                 self.bot.web_solver.mark_verification_done(str(self.bot.user.id))
                 self.bot._solving_captcha = False
                 try:
@@ -213,8 +293,6 @@ class Security(commands.Cog):
                     clear_captcha_challenge(str(self.bot.user.id))
                 except Exception as e:
                     self.bot.log("ERROR", f"Failed to clear captcha challenge: {e}")
-                self.bot.paused = False
-                self.bot.throttle_until = 0.0
                 self.bot.last_sent_time = 0
                 self.bot.warmup_until = 0
                 grinding_cog = self.bot.get_cog('Grinding')
@@ -227,9 +305,11 @@ class Security(commands.Cog):
                 await asyncio.sleep(2)
                 return
 
-            if "letterword" in message.content.lower() and message.attachments:
+            if "letterword" in message_text.lower() and message.attachments:
+                if not self._pause_for_captcha():
+                    return
                 self.bot.log("SECURITY", "Detection AI: Letterword captcha identified in DMs.")
-                count_match = re.search(r'(\d+)\s*letterword', message.content.lower())
+                count_match = re.search(r'(\d+)\s*letterword', message_text.lower())
                 letter_count = int(count_match.group(1)) if count_match else 5
                 image_url = message.attachments[0].url
                 self.bot.log("SYS", f"Attempting to solve DM Captcha ({letter_count} letters)...")
@@ -242,20 +322,15 @@ class Security(commands.Cog):
                         await message.channel.send(answer)
                 else:
                     self.bot.log("ERROR", "AI Solver failed to generate an answer. Pausing bot.")
-                    self.bot.paused = True
-                    self.bot.throttle_until = float('inf')
                     self._show_desktop_notification("AI Solver failed! Solve manually.")
                     self.bot.web_solver.enqueue_manual_solve(str(self.bot.user.id), "https://owobot.com/captcha")
                 return
 
-            captcha_url = self._get_captcha_url(message)
-            if not captcha_url:
-                url_match = re.search(r'https?://owobot\.com/captcha/\S+', message.content)
-                if url_match: captcha_url = url_match.group(0)
+            captcha_url = self._find_captcha_url(message, message_text)
 
             if captcha_url:
-                self.bot.paused = True
-                self.bot.throttle_until = float('inf')
+                if not self._pause_for_captcha():
+                    return
                 self.bot.log("ALARM", "LINK CAPTCHA DETECTED IN DM!")
                 await self.play_beep()
                 self._show_desktop_notification("DM Captcha detected!")
@@ -294,6 +369,7 @@ class Security(commands.Cog):
                     autosolved = await self.bot.web_solver.auto_verify()
                     if autosolved:
                         self.bot._solving_captcha = False
+                        self._resume_after_captcha()
                         self.bot.log("SUCCESS", f"{service_name} solved successfully (DM)!")
                         self._show_desktop_notification(f"{service_name} solved successfully!")
                     else:
@@ -319,32 +395,32 @@ class Security(commands.Cog):
 
         content = message.content or ""
         text_to_check = self._get_security_text(message)
+        captcha_url = self._find_captcha_url(message, text_to_check)
+        captcha_signal = self._has_captcha_signal(text_to_check)
         is_security_event = (
             self._contains_keyword(text_to_check, self.ban_keywords) or
             self.warning_pattern.search(text_to_check) is not None or
             (len(message.attachments) > 0 and self._contains_keyword(text_to_check, self.image_captcha_keywords)) or
-            self._contains_keyword(text_to_check, self.captcha_keywords) or
-            self._get_captcha_url(message) is not None or
-            re.search(r'https?://owobot\.com/captcha/\S+', text_to_check) is not None
+            captcha_signal or
+            captcha_url is not None
         )
-
-        is_for_me = self.bot.is_message_for_me(message)
-        # Safety signals must not depend on the identity matcher. Captcha and
-        # ban messages can be generic or omit the account name entirely.
-        if not is_for_me and not is_security_event:
-            return
 
         try:
             allowed_channels = [int(ch) for ch in self.bot.channels]
         except:
             allowed_channels = [self.bot.channel_id]
 
+        is_for_me = self.bot.is_message_for_me(message)
+        # Safety signals may omit the account name, but they still must come
+        # from one of this account's configured channels.
+        if not is_for_me and message.channel.id not in allowed_channels:
+            return
+
         if not is_security_event and message.channel.id not in allowed_channels:
             return
 
         if self._contains_keyword(text_to_check, self.ban_keywords):
-            self.bot.paused = True
-            self.bot.throttle_until = float('inf')
+            self._pause_for_ban()
             self.bot.log("ALARM", f"BAN DETECTED! Message: {text_to_check[:200]}")
             await self.play_beep()
             self._show_desktop_notification("Ban detected!")
@@ -355,16 +431,10 @@ class Security(commands.Cog):
         if warning_match:
             current_warning = int(warning_match.group(1))
             max_warnings = int(warning_match.group(2))
-            normalized = self._normalize(text_to_check)
-            captcha_url = self._get_captcha_url(message)
-            if not captcha_url:
-                url_match = re.search(r'https?://owobot\.com/captcha/\S+', text_to_check)
-                if url_match:
-                    captcha_url = url_match.group(0)
 
-            if captcha_url or any(kw in normalized for kw in ["pleasecomplete", "captcha", "verify", "human"]):
-                self.bot.paused = True
-                self.bot.throttle_until = float('inf')
+            if captcha_url or captcha_signal:
+                if not self._pause_for_captcha():
+                    return
                 self.bot.stats['last_captcha_msg'] = text_to_check[:200]
                 self.bot.log("ALARM", f"CAPTCHA WARNING DETECTED ({current_warning}/{max_warnings})!")
                 await self.play_beep()
@@ -406,6 +476,7 @@ class Security(commands.Cog):
                         autosolved = await self.bot.web_solver.auto_verify()
                         if autosolved:
                             self.bot._solving_captcha = False
+                            self._resume_after_captcha()
                             self.bot.log("SUCCESS", f"{service_name} solved successfully!")
                             self._show_desktop_notification(f"{service_name} solved successfully!")
                         else:
@@ -428,8 +499,8 @@ class Security(commands.Cog):
         has_image = len(message.attachments) > 0
         image_captcha_hit = self._contains_keyword(text_to_check, self.image_captcha_keywords)
         if has_image and image_captcha_hit:
-            self.bot.paused = True
-            self.bot.throttle_until = float('inf')
+            if not self._pause_for_captcha():
+                return
             self.bot.stats['last_captcha_msg'] = text_to_check[:200]
             self.bot.log("ALARM", "IMAGE CAPTCHA DETECTED! Warning triggered.")
             await self.play_beep()
@@ -453,16 +524,10 @@ class Security(commands.Cog):
                 self.bot.web_solver.enqueue_manual_solve(str(self.bot.user.id), "https://owobot.com/captcha")
             return
 
-        captcha_keywords_hit = self._contains_keyword(text_to_check, self.captcha_keywords)
-        captcha_url = self._get_captcha_url(message)
-        if not captcha_url:
-            url_match = re.search(r'https?://owobot\.com/captcha/\S+', text_to_check)
-            if url_match:
-                captcha_url = url_match.group(0)
-
+        captcha_keywords_hit = captcha_signal
         if captcha_url or captcha_keywords_hit:
-            self.bot.paused = True
-            self.bot.throttle_until = float('inf')
+            if not self._pause_for_captcha():
+                return
             self.bot.stats['last_captcha_msg'] = text_to_check[:200]
             self.bot.log("ALARM", "CAPTCHA DETECTED!")
             await self.play_beep()
@@ -502,6 +567,7 @@ class Security(commands.Cog):
                 autosolved = await self.bot.web_solver.auto_verify()
                 if autosolved:
                     self.bot._solving_captcha = False
+                    self._resume_after_captcha()
                     self.bot.log("SUCCESS", f"{service_name} solved successfully!")
                     self._show_desktop_notification(f"{service_name} solved successfully!")
                 else:

@@ -92,6 +92,9 @@ class NeuraBot(commands.Bot):
         self.modules = {}
         self.active = True
         self.paused = False
+        self.manual_paused = False
+        self.captcha_detected = False
+        self.security_pause_reason = None
         self.warmup_until = time.time() + 10
         self.throttle_until = 0.0
         self.last_sent_time = 0
@@ -241,7 +244,7 @@ class NeuraBot(commands.Bot):
             self.session = aiohttp.ClientSession()
     
     async def _send_safe(self, content, skip_typing=False, target_channel_id=None, priority=False):
-        if not content or not self.is_ready:
+        if not content or not self.is_ready or self.security_pause_reason:
             return False
             
         content = self._fix_command(content)
@@ -267,7 +270,7 @@ class NeuraBot(commands.Bot):
                     if not self.paused and self.throttle_until != float('inf') and self.active:
                         await asyncio.sleep(0.1)
 
-            if not self.active or self.paused:
+            if not self.active or self.paused or self.security_pause_reason:
                 return False
 
             stealth_cfg = self.config.get('stealth', {})
@@ -283,7 +286,7 @@ class NeuraBot(commands.Bot):
                     await asyncio.sleep(sleep_dur)
                     rem_wait -= sleep_dur
 
-            if not self.active or self.paused:
+            if not self.active or self.paused or self.security_pause_reason:
                 return False
 
             c_id = target_channel_id or self.channel_id
@@ -329,6 +332,9 @@ class NeuraBot(commands.Bot):
         was_paused = self.paused
         self.paused = True
         self.throttle_until = float("inf")
+        if self.security_pause_reason is None:
+            self.security_pause_reason = "forbidden"
+            self.captcha_detected = False
         if not was_paused:
             self.log("ALARM", f"Discord send forbidden; bot paused automatically: {error}")
     
@@ -369,7 +375,7 @@ class NeuraBot(commands.Bot):
     async def send_message(self, content, skip_typing=False, priority=False, target_channel_id=None):
         if not self.active:
             return False
-        if self.paused:
+        if self.paused or self.security_pause_reason:
             return False
         
         if state.checking_gems.get(self.user_id):

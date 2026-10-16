@@ -557,10 +557,14 @@ def control():
     if not bot: return jsonify({'success': False, 'error': 'Bot not found'})
     
     if action == 'stop':
+        bot.manual_paused = True
         bot.paused = True
         bot.log("SYS", "Bot STOPPED via Dashboard")
             
     elif action == 'start':
+        if getattr(bot, 'security_pause_reason', None):
+            return jsonify({'success': False, 'error': 'Security pause requires verified captcha or manual review'}), 409
+        bot.manual_paused = False
         bot.paused = False
         bot.throttle_until = 0
         bot.log("SYS", "Bot RESUMED via Dashboard")
@@ -585,6 +589,8 @@ def security():
     if not bot: return jsonify({'success': False, 'error': 'Bot not found'})
 
     if action == 'resume':
+        if getattr(bot, 'security_pause_reason', None):
+            return jsonify({'success': False, 'error': 'Security pause requires verified captcha or manual review'}), 409
         bot.paused = False
         bot.throttle_until = 0
         state.log_command("SEC", f"User Resumed {bot.username} from Security Alert", "success")

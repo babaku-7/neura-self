@@ -34,19 +34,21 @@ class Control(commands.Cog):
         content = message.content.lower().strip()
         
         if content == '.stop':
+            self.bot.manual_paused = True
             if not self.bot.paused:
                 self.bot.paused = True
                 state.bot_paused = True
                 self.bot.log("SYS", "Bot PAUSED via Chat cmd")
                 
         elif content == '.start' or content == '.resume':
+            if getattr(self.bot, 'security_pause_reason', None):
+                self.bot.log("SECURITY", "Resume command ignored while a security pause is active.")
+                return
             if self.bot.paused:
+                self.bot.manual_paused = False
                 self.bot.paused = False
                 state.bot_paused = False
                 state.active_session_start = time.time()
-                for bot in state.bot_instances:
-                    bot.paused = False
-                    bot.throttle_until = 0
                 self.bot.log("SYS", "Bot RESUMED via Chat cmd")
 
 
