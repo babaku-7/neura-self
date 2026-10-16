@@ -176,6 +176,30 @@ class Security(commands.Cog):
                     return url
         return None
 
+    def _get_security_text(self, message):
+        parts = [message.content or ""]
+        for embed in getattr(message, "embeds", []) or []:
+            parts.extend([
+                getattr(embed, "title", "") or "",
+                getattr(getattr(embed, "author", None), "name", "") or "",
+                getattr(embed, "description", "") or "",
+                getattr(getattr(embed, "footer", None), "text", "") or "",
+            ])
+            for field in getattr(embed, "fields", []) or []:
+                parts.extend([
+                    getattr(field, "name", "") or "",
+                    getattr(field, "value", "") or "",
+                ])
+
+        for component in getattr(message, "components", []) or []:
+            for child in getattr(component, "children", []) or []:
+                for attr in ("label", "custom_id", "url"):
+                    value = getattr(child, attr, None)
+                    if value:
+                        parts.append(str(value))
+
+        return " ".join(str(part) for part in parts if part)
+
     @commands.Cog.listener()
     async def on_message(self, message):
         if not self.enabled: return
@@ -294,19 +318,7 @@ class Security(commands.Cog):
             self.bot.owo_user = message.author
 
         content = message.content or ""
-        embed_text = ""
-        if message.embeds:
-            parts = []
-            for e in message.embeds:
-                if e.title: parts.append(e.title)
-                if e.description: parts.append(e.description)
-                if e.footer and e.footer.text: parts.append(e.footer.text)
-            embed_text = " ".join(parts)
-        text_to_check = f"{content} {embed_text}"
-        is_for_me = self.bot.is_message_for_me(message)
-        if not is_for_me: return
-
-
+        text_to_check = self._get_security_text(message)
         is_security_event = (
             self._contains_keyword(text_to_check, self.ban_keywords) or
             self.warning_pattern.search(text_to_check) is not None or
@@ -315,6 +327,12 @@ class Security(commands.Cog):
             self._get_captcha_url(message) is not None or
             re.search(r'https?://owobot\.com/captcha/\S+', text_to_check) is not None
         )
+
+        is_for_me = self.bot.is_message_for_me(message)
+        # Safety signals must not depend on the identity matcher. Captcha and
+        # ban messages can be generic or omit the account name entirely.
+        if not is_for_me and not is_security_event:
+            return
 
         try:
             allowed_channels = [int(ch) for ch in self.bot.channels]
@@ -326,7 +344,8 @@ class Security(commands.Cog):
 
         if self._contains_keyword(text_to_check, self.ban_keywords):
             self.bot.paused = True
-            self.bot.log("ALARM", "BAN DETECTED!")
+            self.bot.throttle_until = float('inf')
+            self.bot.log("ALARM", f"BAN DETECTED! Message: {text_to_check[:200]}")
             await self.play_beep()
             self._show_desktop_notification("Ban detected!")
             self._send_webhook("BAN DETECTED", f"Message:\n{content}")

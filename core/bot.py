@@ -291,6 +291,9 @@ class NeuraBot(commands.Bot):
             if not channel:
                 try:
                     channel = await self.fetch_channel(c_id)
+                except discord.Forbidden as e:
+                    self._pause_after_send_forbidden(e)
+                    return False
                 except Exception as e:
                     self.log("ERROR", f"Failed to fetch channel {c_id}: {e}")
                     return False
@@ -314,9 +317,20 @@ class NeuraBot(commands.Bot):
                     self.last_typing_time = None
                 self.log("CMD", f"Sent: {short_cmd}{typing_str}")
                 return True
+            except discord.Forbidden as e:
+                self._pause_after_send_forbidden(e)
+                return False
             except Exception as e:
                 self.log("ERROR", f"Send failed: {str(e)}")
                 return False
+
+    def _pause_after_send_forbidden(self, error):
+        """Stop scheduling commands after Discord rejects a send with HTTP 403."""
+        was_paused = self.paused
+        self.paused = True
+        self.throttle_until = float("inf")
+        if not was_paused:
+            self.log("ALARM", f"Discord send forbidden; bot paused automatically: {error}")
     
     def _fix_command(self, command):
         cmd = command.strip()

@@ -19,6 +19,7 @@ NeuraSelf-UwU - https://github.com/routo-loop/neura-self
 import asyncio
 import random
 import time
+import discord
 
 SPEED_PRESETS = {
     "fast": {
@@ -124,6 +125,9 @@ class NeuraHuman:
             try:
                 await channel.send(content)
                 return True
+            except discord.Forbidden as error:
+                bot._pause_after_send_forbidden(error)
+                return False
             except Exception:
                 return False
 
@@ -176,10 +180,16 @@ class NeuraHuman:
                 await channel.send(content)
                 return True
 
+        except discord.Forbidden as error:
+            bot._pause_after_send_forbidden(error)
+            return False
         except Exception:
             try:
                 await channel.send(content)
                 return True
+            except discord.Forbidden as error:
+                bot._pause_after_send_forbidden(error)
+                return False
             except Exception as final_e:
                 bot.log("ERROR", f"Critical send failure: {final_e}")
                 return False
